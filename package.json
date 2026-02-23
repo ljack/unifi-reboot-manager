@@ -1,0 +1,9 @@
+{
+  "name": "unifi-reboot-manager",
+  "version": "1.0.0",
+  "description": "Web UI for rebooting UniFi devices with real-time monitoring",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

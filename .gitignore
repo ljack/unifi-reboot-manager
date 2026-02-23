@@ -1,0 +1,5 @@
+.env
+.claude/
+.playwright-mcp/
+node_modules/
+*.png
