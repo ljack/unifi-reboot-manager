@@ -1,7 +1,7 @@
 // ============================================================
 // UniFi Reboot Manager
 // Single-file Node.js server with embedded web UI
-// Zero dependencies — uses only node:http, node:child_process
+// Zero dependencies — uses only node:http, node:child_process, node:net
 // Run: node server.js → http://localhost:3000
 // ============================================================
 
@@ -9,6 +9,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const net = require('node:net');
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
@@ -34,12 +35,15 @@ const UNIFI = {
 const PING_MS = 2000;
 const POLL_MS = 5000;
 const STUCK_MS = 300000;
+const PING_HISTORY_MAX = 60;
 
 // ---- State ----
 const devices = new Map();
 const clients = new Set();
 let monitoring = false;
+let pinging = false;
 let pingTimer, pollTimer, stuckTimer;
+let pingingTimer;
 
 // ---- UniFi API ----
 const apiUrl = (path) => `${UNIFI.base}/v1/sites/${UNIFI.site}${path}`;
@@ -60,14 +64,48 @@ async function apiPost(path, body) {
   return { status: res.status, ok: res.ok };
 }
 
-// ---- Ping ----
-function ping(ip) {
+// ---- Connectivity Checks ----
+const isLinux = process.platform === 'linux';
+
+function checkICMP(ip) {
   return new Promise((resolve) => {
-    const proc = spawn('ping', ['-c', '1', '-W', '1000', ip]);
-    const timer = setTimeout(() => { proc.kill(); resolve(false); }, 3000);
-    proc.on('close', (code) => { clearTimeout(timer); resolve(code === 0); });
-    proc.on('error', () => { clearTimeout(timer); resolve(false); });
+    try {
+      const t0 = performance.now();
+      const args = ['-c', '1', '-W', isLinux ? '1' : '1000', ip];
+      const proc = spawn('ping', args);
+      const timer = setTimeout(() => { proc.kill(); resolve({ ok: false, ms: +(performance.now() - t0).toFixed(1) }); }, 2000);
+      proc.on('close', (code) => { clearTimeout(timer); resolve({ ok: code === 0, ms: +(performance.now() - t0).toFixed(1) }); });
+      proc.on('error', () => { clearTimeout(timer); resolve({ ok: false, ms: +(performance.now() - t0).toFixed(1) }); });
+    } catch { resolve({ ok: false, ms: 0 }); }
   });
+}
+
+function checkTCP(ip, port) {
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+    const sock = net.createConnection({ host: ip, port, timeout: 2000 });
+    const timer = setTimeout(() => { sock.destroy(); resolve({ ok: false, ms: +(performance.now() - t0).toFixed(1) }); }, 2000);
+    sock.on('connect', () => { clearTimeout(timer); sock.destroy(); resolve({ ok: true, ms: +(performance.now() - t0).toFixed(1) }); });
+    sock.on('timeout', () => { clearTimeout(timer); sock.destroy(); resolve({ ok: false, ms: +(performance.now() - t0).toFixed(1) }); });
+    sock.on('error', () => { clearTimeout(timer); sock.destroy(); resolve({ ok: false, ms: +(performance.now() - t0).toFixed(1) }); });
+  });
+}
+
+async function checkConnectivity(ip) {
+  const [icmp, tcp22, tcp443, tcp8080, tcp8443] = await Promise.allSettled([
+    checkICMP(ip),
+    checkTCP(ip, 22),
+    checkTCP(ip, 443),
+    checkTCP(ip, 8080),
+    checkTCP(ip, 8443),
+  ]);
+  return {
+    icmp: icmp.status === 'fulfilled' ? icmp.value : { ok: false, ms: 0 },
+    tcp22: tcp22.status === 'fulfilled' ? tcp22.value : { ok: false, ms: 0 },
+    tcp443: tcp443.status === 'fulfilled' ? tcp443.value : { ok: false, ms: 0 },
+    tcp8080: tcp8080.status === 'fulfilled' ? tcp8080.value : { ok: false, ms: 0 },
+    tcp8443: tcp8443.status === 'fulfilled' ? tcp8443.value : { ok: false, ms: 0 },
+  };
 }
 
 // ---- Device Type ----
@@ -128,8 +166,9 @@ async function initDevices() {
       isGateway: type === 'gateway',
       history: [{ state: d.state === 'ONLINE' ? 'ONLINE' : 'OFFLINE', time: Date.now() }],
       stateChangedAt: Date.now(),
-      lastPing: null,
+      lastCheck: null,
       stats: null,
+      pingHistory: [],
     });
   }
   await fetchAllStats();
@@ -146,16 +185,21 @@ function setState(id, newState) {
   log(`${ds.device.name}: ${newState}`, lvl);
 }
 
-function onPing(id, alive) {
+function onCheck(id, checks) {
   const ds = devices.get(id);
   if (!ds) return;
-  ds.lastPing = { alive, time: Date.now() };
+  const alive = Object.values(checks).some(v => v.ok);
+  const time = Date.now();
+  const entry = { time, checks, alive };
+  ds.lastCheck = { checks, alive, time };
+  ds.pingHistory.push(entry);
+  if (ds.pingHistory.length > PING_HISTORY_MAX) ds.pingHistory.shift();
   switch (ds.state) {
     case 'REBOOT_SENT': if (!alive) setState(id, 'GOING_OFFLINE'); break;
     case 'GOING_OFFLINE': if (!alive) setState(id, 'OFFLINE'); break;
     case 'OFFLINE': if (alive) setState(id, 'COMING_BACK'); break;
   }
-  broadcast({ type: 'ping', id, alive, time: Date.now() });
+  broadcast({ type: 'ping', id, entry, alive, time });
 }
 
 function onApiState(id, apiState, deviceData) {
@@ -178,7 +222,7 @@ function startMonitoring() {
     await Promise.allSettled(
       [...devices].map(([id, ds]) =>
         ds.device.ipAddress
-          ? ping(ds.device.ipAddress).then((alive) => onPing(id, alive))
+          ? checkConnectivity(ds.device.ipAddress).then((checks) => onCheck(id, checks))
           : Promise.resolve()
       )
     );
@@ -277,6 +321,44 @@ async function rebootOne(id) {
   }
 }
 
+// ---- Ping Sweep ----
+function startPinging() {
+  if (pinging) return;
+  pinging = true;
+  broadcast({ type: 'pinging-started' });
+  log('Ping sweep started');
+
+  // Run immediately, then repeat
+  const sweep = async () => {
+    await Promise.allSettled(
+      [...devices].map(([id, ds]) =>
+        ds.device.ipAddress
+          ? checkConnectivity(ds.device.ipAddress).then((checks) => onCheck(id, checks))
+          : Promise.resolve()
+      )
+    );
+  };
+  sweep();
+  pingingTimer = setInterval(sweep, PING_MS);
+}
+
+function stopPinging() {
+  if (!pinging) return;
+  clearInterval(pingingTimer);
+  pinging = false;
+  broadcast({ type: 'pinging-stopped' });
+  log('Ping sweep stopped');
+}
+
+async function pingOne(id) {
+  const ds = devices.get(id);
+  if (!ds) throw new Error('Device not found');
+  if (!ds.device.ipAddress) throw new Error('No IP address');
+  const checks = await checkConnectivity(ds.device.ipAddress);
+  onCheck(id, checks);
+  return { ok: true, checks };
+}
+
 // ---- HTTP Server ----
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
@@ -293,7 +375,7 @@ const server = http.createServer(async (req, res) => {
       const list = [...devices].map(([id, ds]) => ({
         id, ...ds.device,
         internalState: ds.state, type: ds.type,
-        isGateway: ds.isGateway, lastPing: ds.lastPing, history: ds.history,
+        isGateway: ds.isGateway, lastCheck: ds.lastCheck, history: ds.history,
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify(list));
@@ -314,6 +396,28 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify(result));
     }
 
+    // POST /api/ping-all
+    if (req.method === 'POST' && url.pathname === '/api/ping-all') {
+      startPinging();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+
+    // POST /api/ping-all/stop
+    if (req.method === 'POST' && url.pathname === '/api/ping-all/stop') {
+      stopPinging();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+
+    // POST /api/devices/:id/ping
+    const mp = url.pathname.match(/^\/api\/devices\/([^/]+)\/ping$/);
+    if (req.method === 'POST' && mp) {
+      const result = await pingOne(mp[1]);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(result));
+    }
+
     // GET /api/events → SSE
     if (req.method === 'GET' && url.pathname === '/api/events') {
       res.writeHead(200, {
@@ -326,11 +430,11 @@ const server = http.createServer(async (req, res) => {
       for (const [id, ds] of devices) {
         state[id] = {
           state: ds.state, device: ds.device, type: ds.type,
-          isGateway: ds.isGateway, history: ds.history, lastPing: ds.lastPing,
-          stats: ds.stats,
+          isGateway: ds.isGateway, history: ds.history, lastCheck: ds.lastCheck,
+          stats: ds.stats, pingHistory: ds.pingHistory,
         };
       }
-      res.write(`data: ${JSON.stringify({ type: 'full-state', devices: state, monitoring })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'full-state', devices: state, monitoring, pinging })}\n\n`);
 
       clients.add(res);
       const keepalive = setInterval(() => res.write(': keepalive\n\n'), 30000);
@@ -349,9 +453,18 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// ---- Background stats refresh (when not monitoring) ----
+// ---- Background checks (when not monitoring) ----
 setInterval(() => {
-  if (!monitoring && clients.size > 0) fetchAllStats().catch(() => {});
+  if (!monitoring && clients.size > 0) {
+    fetchAllStats().catch(() => {});
+    Promise.allSettled(
+      [...devices].map(([id, ds]) =>
+        ds.device.ipAddress
+          ? checkConnectivity(ds.device.ipAddress).then((checks) => onCheck(id, checks))
+          : Promise.resolve()
+      )
+    ).catch(() => {});
+  }
 }, 10000);
 
 // ---- Startup ----
@@ -390,6 +503,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 header h1{font-size:17px;font-weight:600;letter-spacing:-0.3px}
 .hdr-right{display:flex;align-items:center;gap:12px}
 .progress{font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
+.filter-input{padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font-size:12px;font-family:inherit;width:160px;outline:none}
+.filter-input:focus{border-color:var(--blue)}
+.filter-input::placeholder{color:var(--dim)}
 .sort-select{padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font-size:12px;font-family:inherit;cursor:pointer;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238b949e'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 8px center;padding-right:24px}
 .sort-select:hover{border-color:var(--dim)}
 .sort-select option{background:var(--surface);color:var(--text)}
@@ -404,8 +520,8 @@ header h1{font-size:17px;font-weight:600;letter-spacing:-0.3px}
 
 /* Layout */
 .layout{display:flex;height:calc(100vh - 49px)}
-main{flex:1;overflow-y:auto;padding:20px 24px 220px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+main{flex:0 0 30%;overflow-y:auto;padding:20px 16px 220px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
 
 /* Card */
 .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px;cursor:pointer;transition:all .2s;position:relative}
@@ -441,7 +557,7 @@ main{flex:1;overflow-y:auto;padding:20px 24px 220px}
 .card-stats .val{color:var(--muted)}
 
 /* Detail panel (persistent sidebar) */
-.d-panel{width:340px;flex-shrink:0;background:var(--surface);border-left:1px solid var(--border);overflow-y:auto;padding:20px;display:flex;flex-direction:column}
+.d-panel{flex:0 0 70%;background:var(--surface);border-left:1px solid var(--border);overflow-y:auto;padding:20px 24px;display:flex;flex-direction:column}
 .d-placeholder{display:flex;align-items:center;justify-content:center;height:100%;color:var(--dim);font-size:13px;text-align:center;padding:24px;line-height:1.6}
 .d-status{display:inline-flex;align-items:center;gap:8px;padding:4px 12px;border-radius:14px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:16px}
 .d-name{font-size:18px;font-weight:600;margin-bottom:2px}
@@ -458,6 +574,11 @@ main{flex:1;overflow-y:auto;padding:20px 24px 220px}
 .d-metric.wide{grid-column:span 2}
 .meter{height:4px;background:var(--border);border-radius:2px;margin-top:6px;overflow:hidden}
 .meter-fill{height:100%;border-radius:2px;transition:width .3s}
+.d-conn-row{display:flex;align-items:center;gap:10px;padding:5px 0;font-size:13px}
+.d-conn-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.d-conn-dot.pass{background:var(--green)}.d-conn-dot.fail{background:var(--red)}.d-conn-dot.none{background:var(--dim);opacity:.4}
+.d-conn-label{color:var(--muted);min-width:60px}
+.d-conn-status{font-size:12px}
 .d-hist h3{font-size:12px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)}
 .h-entry{display:flex;align-items:center;gap:10px;padding:5px 0;font-size:12px;border-top:1px solid var(--border)}
 .h-time{color:var(--dim);font-variant-numeric:tabular-nums;min-width:68px}
@@ -483,6 +604,21 @@ main{flex:1;overflow-y:auto;padding:20px 24px 220px}
 .c-dialog p{font-size:13px;color:var(--muted);line-height:1.55;margin-bottom:20px}
 .c-btns{display:flex;justify-content:flex-end;gap:8px}
 
+/* Response time graph */
+.rt-graph{background:var(--bg);border-radius:6px;padding:10px;margin-bottom:8px}
+.rt-graph svg{display:block;width:100%;height:auto}
+.rt-legend{display:flex;flex-wrap:wrap;gap:8px 14px;font-size:11px;color:var(--muted);margin-bottom:4px}
+.rt-legend span{display:flex;align-items:center;gap:4px}
+.rt-legend i{width:10px;height:3px;border-radius:1px;display:inline-block}
+
+/* Ping history table */
+.ph-wrap{max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;background:var(--bg)}
+.ph-table{width:100%;border-collapse:collapse;font-size:11px;font-variant-numeric:tabular-nums}
+.ph-table thead{position:sticky;top:0;background:var(--surface2);z-index:1}
+.ph-table th{padding:5px 8px;text-align:left;font-weight:600;color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid var(--border)}
+.ph-table td{padding:4px 8px;border-top:1px solid var(--border)}
+.ph-table .ph-ok{color:var(--green)}.ph-table .ph-fail{color:var(--red)}.ph-table .ph-timeout{color:var(--dim)}
+
 ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 </style>
 </head>
@@ -491,6 +627,7 @@ main{flex:1;overflow-y:auto;padding:20px 24px 220px}
 <header>
   <h1>UniFi Reboot Manager</h1>
   <div class="hdr-right">
+    <input id="filterInput" class="filter-input" type="text" placeholder="Filter devices..." oninput="onFilter()">
     <span id="progress" class="progress"></span>
     <span class="sort-label">Sort</span>
     <select id="sortSelect" class="sort-select" onchange="onSort()">
@@ -503,6 +640,7 @@ main{flex:1;overflow-y:auto;padding:20px 24px 220px}
       <option value="cpu">CPU Usage</option>
       <option value="memory">Memory Usage</option>
     </select>
+    <button id="pingBtn" class="btn" onclick="togglePingAll()">Ping All</button>
     <button id="rebootBtn" class="btn btn-red" onclick="showConfirm()">Reboot All</button>
   </div>
 </header>
@@ -539,8 +677,11 @@ main{flex:1;overflow-y:auto;padding:20px 24px 220px}
 let D = {};
 let selId = null;
 let active = false;
+let pingingState = false;
 let es = null;
 let sortBy = 'name';
+let filterText = '';
+let rtGraphData = null; // stored for hover handler
 
 const STATE_COLORS = {
   ONLINE:'green',REBOOT_SENT:'amber',GOING_OFFLINE:'orange',
@@ -570,8 +711,8 @@ function connectSSE(){
 function handle(ev){
   switch(ev.type){
     case 'full-state':
-      D=ev.devices;active=ev.monitoring||false;
-      renderGrid();updateProgress();updateBtn();
+      D=ev.devices;active=ev.monitoring||false;pingingState=ev.pinging||false;
+      renderGrid();updateProgress();updateBtn();updatePingBtn();
       break;
     case 'state-change':
       if(D[ev.id]){
@@ -585,7 +726,14 @@ function handle(ev){
       }
       break;
     case 'ping':
-      if(D[ev.id])D[ev.id].lastPing={alive:ev.alive,time:ev.time};
+      if(D[ev.id]){
+        const e=ev.entry;
+        D[ev.id].lastCheck={checks:e.checks,alive:e.alive,time:e.time};
+        D[ev.id].pingHistory=D[ev.id].pingHistory||[];
+        D[ev.id].pingHistory.push(e);
+        if(D[ev.id].pingHistory.length>60)D[ev.id].pingHistory.shift();
+        if(selId===ev.id)renderDetail(ev.id);
+      }
       break;
     case 'stats-update':
       if(ev.stats){for(const[id,s]of Object.entries(ev.stats)){if(D[id])D[id].stats=s}}
@@ -599,6 +747,10 @@ function handle(ev){
       active=true;updateBtn();break;
     case 'monitoring-complete':
       active=false;updateBtn();break;
+    case 'pinging-started':
+      pingingState=true;updatePingBtn();break;
+    case 'pinging-stopped':
+      pingingState=false;updatePingBtn();break;
   }
 }
 
@@ -627,10 +779,18 @@ function sortDevices(entries){
 }
 
 function onSort(){sortBy=document.getElementById('sortSelect').value;renderGrid()}
+function onFilter(){filterText=document.getElementById('filterInput').value.toLowerCase().trim();renderGrid()}
+
+function matchesFilter(d){
+  if(!filterText)return true;
+  const dev=d.device;
+  const hay=[(dev.name||''),(dev.ipAddress||''),(dev.model||''),d.type||''].join(' ').toLowerCase();
+  return hay.includes(filterText);
+}
 
 function renderGrid(){
   const g=document.getElementById('grid');
-  const sorted=sortDevices(Object.entries(D));
+  const sorted=sortDevices(Object.entries(D).filter(([,d])=>matchesFilter(d)));
   g.innerHTML=sorted.map(([id,d])=>{
     const dev=d.device;
     return '<div class="card '+sc(d.state)+'" data-id="'+id+'" onclick="showDetail(\\''+id+'\\')">'
@@ -696,6 +856,23 @@ function updateBtn(){
   b.textContent=active?'Rebooting...':'Reboot All';
 }
 
+function updatePingBtn(){
+  const b=document.getElementById('pingBtn');
+  b.textContent=pingingState?'Stop Pinging':'Ping All';
+}
+
+async function togglePingAll(){
+  try{
+    if(pingingState){await fetch('/api/ping-all/stop',{method:'POST'})}
+    else{await fetch('/api/ping-all',{method:'POST'})}
+  }catch(e){addLog('Ping request failed: '+e.message,'error')}
+}
+
+async function pingOneDevice(id){
+  try{await fetch('/api/devices/'+id+'/ping',{method:'POST'})}
+  catch(e){addLog('Ping request failed: '+e.message,'error')}
+}
+
 function showDetail(id){
   // Toggle if clicking same card
   if(selId===id){selId=null;clearSelection();return}
@@ -717,6 +894,148 @@ function stateColor(s){
   return{green:'var(--green)',amber:'var(--amber)',orange:'var(--orange)',red:'var(--red)',blue:'var(--blue)',muted:'var(--muted)'}[c];
 }
 
+const RT_COLORS={icmp:'#3fb950',tcp22:'#58a6ff',tcp443:'#bc8cff',tcp8080:'#56d4dd',tcp8443:'#d29922'};
+const RT_LABELS={icmp:'ICMP',tcp22:'TCP 22',tcp443:'TCP 443',tcp8080:'TCP 8080',tcp8443:'TCP 8443'};
+
+function renderRTGraph(ph){
+  const W=600,H=150,PAD_L=0,PAD_R=38,PAD_T=8,PAD_B=8;
+  const keys=Object.keys(RT_COLORS);
+  let maxMs=10;
+  for(const e of ph){for(const k of keys){const v=e.checks[k];if(v){const ms=typeof v==='object'?v.ms:0;if(ms>maxMs)maxMs=ms}}}
+  maxMs=Math.ceil(maxMs/10)*10||10;
+  const n=ph.length;
+  const plotW=W-PAD_L-PAD_R;
+  const xStep=plotW/(n>1?n-1:1);
+  // Store for hover handler
+  rtGraphData={ph,W,H,PAD_L,PAD_R,PAD_T,PAD_B,maxMs,xStep,keys};
+  let svg='<div class="d-section"><h3>Response Times</h3><div class="rt-graph">'
+    +'<svg id="rtSvg" viewBox="0 0 '+W+' '+H+'" xmlns="http://www.w3.org/2000/svg" onmousemove="rtHover(event)" onmouseleave="rtHideTooltip()">';
+  // Grid lines
+  for(let i=0;i<=4;i++){
+    const y=PAD_T+(H-PAD_T-PAD_B)*i/4;
+    svg+='<line x1="'+PAD_L+'" y1="'+y+'" x2="'+(W-PAD_R)+'" y2="'+y+'" stroke="#30363d" stroke-width="0.5"/>';
+    svg+='<text x="'+(W-2)+'" y="'+(y+3)+'" fill="#6e7681" font-size="5.5" text-anchor="end">'+Math.round(maxMs*(1-i/4))+'ms</text>';
+  }
+  // Polylines
+  for(const k of keys){
+    const pts=ph.map((e,i)=>{
+      const v=e.checks[k];
+      const ms=v&&typeof v==='object'?v.ms:0;
+      const x=PAD_L+i*xStep;
+      const y=PAD_T+(H-PAD_T-PAD_B)*(1-Math.min(ms,maxMs)/maxMs);
+      return x.toFixed(1)+','+y.toFixed(1);
+    }).join(' ');
+    svg+='<polyline points="'+pts+'" fill="none" stroke="'+RT_COLORS[k]+'" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" opacity="0.85"/>';
+  }
+  // Hover elements: cursor line, dots, tooltip
+  svg+='<line id="rtCursor" x1="0" y1="'+PAD_T+'" x2="0" y2="'+(H-PAD_B)+'" stroke="#8b949e" stroke-width="0.5" stroke-dasharray="3,3" visibility="hidden"/>';
+  for(const k of keys){
+    svg+='<circle id="rtDot-'+k+'" r="2" fill="'+RT_COLORS[k]+'" stroke="var(--bg)" stroke-width="0.8" visibility="hidden"/>';
+  }
+  svg+='<g id="rtTip" visibility="hidden">'
+    +'<rect id="rtTipBg" rx="3" ry="3" fill="#1c2333" stroke="#30363d" stroke-width="0.5"/>'
+    +'<text id="rtTipText" fill="#e6edf3" font-size="5.5" font-family="sans-serif"></text>'
+    +'</g>';
+  // Transparent overlay for mouse events
+  svg+='<rect x="0" y="0" width="'+W+'" height="'+H+'" fill="transparent"/>';
+  svg+='</svg></div>';
+  // Legend
+  svg+='<div class="rt-legend">';
+  for(const k of keys){
+    svg+='<span><i style="background:'+RT_COLORS[k]+'"></i>'+RT_LABELS[k]+'</span>';
+  }
+  svg+='</div></div>';
+  return svg;
+}
+
+function rtHover(evt){
+  const g=rtGraphData;if(!g)return;
+  const svg=document.getElementById('rtSvg');if(!svg)return;
+  const pt=svg.createSVGPoint();
+  pt.x=evt.clientX;pt.y=evt.clientY;
+  const svgPt=pt.matrixTransform(svg.getScreenCTM().inverse());
+  const idx=Math.round((svgPt.x-g.PAD_L)/g.xStep);
+  if(idx<0||idx>=g.ph.length){rtHideTooltip();return}
+  const entry=g.ph[idx];
+  const cx=g.PAD_L+idx*g.xStep;
+  // Cursor line
+  const cursor=document.getElementById('rtCursor');
+  cursor.setAttribute('x1',cx);cursor.setAttribute('x2',cx);cursor.setAttribute('visibility','visible');
+  // Dots
+  const lines=[];
+  for(const k of g.keys){
+    const dot=document.getElementById('rtDot-'+k);
+    const v=entry.checks[k];
+    const ms=v&&typeof v==='object'?v.ms:0;
+    const ok=v&&typeof v==='object'?v.ok:false;
+    const y=g.PAD_T+(g.H-g.PAD_T-g.PAD_B)*(1-Math.min(ms,g.maxMs)/g.maxMs);
+    dot.setAttribute('cx',cx);dot.setAttribute('cy',y);dot.setAttribute('visibility','visible');
+    lines.push({label:RT_LABELS[k],ms:ms,ok:ok,color:RT_COLORS[k]});
+  }
+  // Tooltip
+  const tip=document.getElementById('rtTip');
+  const tipText=document.getElementById('rtTipText');
+  const tipBg=document.getElementById('rtTipBg');
+  // Build text lines
+  const timeStr=ft(entry.time);
+  tipText.innerHTML='';
+  const tspan0=document.createElementNS('http://www.w3.org/2000/svg','tspan');
+  tspan0.setAttribute('x','0');tspan0.setAttribute('dy','0');
+  tspan0.setAttribute('fill','#8b949e');tspan0.setAttribute('font-size','5');
+  tspan0.textContent=timeStr;
+  tipText.appendChild(tspan0);
+  for(const l of lines){
+    const ts=document.createElementNS('http://www.w3.org/2000/svg','tspan');
+    ts.setAttribute('x','0');ts.setAttribute('dy','7');
+    ts.setAttribute('fill',l.color);
+    ts.textContent=l.label+': '+l.ms.toFixed(1)+'ms'+(l.ok?'':' \\u2717');
+    tipText.appendChild(ts);
+  }
+  // Position tooltip
+  const tipW=65,tipH=48;
+  let tx=cx+8,ty=g.PAD_T;
+  if(tx+tipW>g.W-g.PAD_R)tx=cx-tipW-8;
+  tipBg.setAttribute('x',tx-4);tipBg.setAttribute('y',ty-2);
+  tipBg.setAttribute('width',tipW);tipBg.setAttribute('height',tipH);
+  tipText.setAttribute('x',tx);tipText.setAttribute('y',ty+7);
+  // Update tspan x positions
+  tipText.querySelectorAll('tspan').forEach(t=>t.setAttribute('x',tx));
+  tip.setAttribute('visibility','visible');
+}
+
+function rtHideTooltip(){
+  const tip=document.getElementById('rtTip');if(tip)tip.setAttribute('visibility','hidden');
+  const cursor=document.getElementById('rtCursor');if(cursor)cursor.setAttribute('visibility','hidden');
+  const g=rtGraphData;if(!g)return;
+  for(const k of g.keys){const dot=document.getElementById('rtDot-'+k);if(dot)dot.setAttribute('visibility','hidden')}
+}
+
+function renderPHTable(ph){
+  const keys=['icmp','tcp22','tcp443','tcp8080','tcp8443'];
+  const labels=['ICMP','TCP 22','TCP 443','TCP 8080','TCP 8443'];
+  let h='<div class="d-section"><h3>Ping History</h3><div class="ph-wrap"><table class="ph-table"><thead><tr><th>Time</th>';
+  for(const l of labels)h+='<th>'+l+'</th>';
+  h+='</tr></thead><tbody>';
+  const rows=ph.slice().reverse();
+  for(const e of rows){
+    h+='<tr><td style="color:var(--dim)">'+ft(e.time)+'</td>';
+    for(const k of keys){
+      const v=e.checks[k];
+      const isObj=v&&typeof v==='object';
+      const ok=isObj?v.ok:v===true;
+      const ms=isObj?v.ms:null;
+      let cls='ph-fail';
+      if(ok)cls=ms!=null&&ms>=2000?'ph-timeout':'ph-ok';
+      else if(ms!=null&&ms>=2000)cls='ph-timeout';
+      const txt=ms!=null?ms.toFixed(1):'—';
+      h+='<td class="'+cls+'">'+txt+'</td>';
+    }
+    h+='</tr>';
+  }
+  h+='</tbody></table></div></div>';
+  return h;
+}
+
 function renderDetail(id){
   const d=D[id];if(!d)return;
   const dev=d.device;const s=d.stats;
@@ -736,6 +1055,37 @@ function renderDetail(id){
     +'<span class="d-label">Firmware</span><span>'+(dev.firmwareVersion||'—')+'</span>'
     +'<span class="d-label">Features</span><span>'+((dev.features||[]).join(', ')||'—')+'</span>'
     +'</div></div>';
+
+  // Connectivity (with ms values)
+  html+='<div class="d-section"><h3>Connectivity</h3>';
+  const lc=d.lastCheck;
+  const checks=lc?lc.checks:null;
+  const CHECKS=[{key:'icmp',label:'ICMP'},{key:'tcp22',label:'TCP 22'},{key:'tcp443',label:'TCP 443'},{key:'tcp8080',label:'TCP 8080'},{key:'tcp8443',label:'TCP 8443'}];
+  CHECKS.forEach(function(m){
+    const val=checks?checks[m.key]:null;
+    const isObj=val&&typeof val==='object';
+    const ok=isObj?val.ok:val===true;
+    const ms=isObj?val.ms:null;
+    const cls=ok===true?'pass':ok===false?'fail':'none';
+    const txt=ok===true?'OK':ok===false?'Fail':'—';
+    const msStr=ms!=null?' <span style="color:var(--dim);font-size:11px">'+ms.toFixed(1)+'ms</span>':'';
+    html+='<div class="d-conn-row"><span class="d-conn-dot '+cls+'"></span>'
+      +'<span class="d-conn-label">'+m.label+'</span>'
+      +'<span class="d-conn-status">'+txt+msStr+'</span></div>';
+  });
+  if(lc&&lc.time)html+='<div style="font-size:11px;color:var(--dim);margin-top:4px">Last check: '+ft(lc.time)+'</div>';
+  html+='</div>';
+
+  // Response Time Graph
+  const ph=d.pingHistory||[];
+  if(ph.length>1){
+    html+=renderRTGraph(ph);
+  }
+
+  // Ping History Table
+  if(ph.length>0){
+    html+=renderPHTable(ph);
+  }
 
   // Statistics
   if(s){
@@ -791,6 +1141,9 @@ function renderDetail(id){
 
     html+='</div></div>';
   }
+
+  // Ping button
+  html+='<button class="btn" style="width:100%;margin-bottom:8px" onclick="pingOneDevice(\\''+id+'\\')">Ping This Device</button>';
 
   // Reboot button
   html+='<button class="btn btn-red" style="width:100%;margin-bottom:20px" onclick="rebootOne(\\''+id+'\\')"'
