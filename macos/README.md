@@ -14,7 +14,7 @@ A native macOS application for managing and rebooting UniFi network devices. Bui
 - Detailed device information panel with uptime, firmware, and statistics
 - Reboot individual devices or all devices at once
 - Event log for tracking actions
-- Persistent settings stored in UserDefaults
+- API key stored securely in macOS Keychain
 
 ## Requirements
 
@@ -44,13 +44,12 @@ xcodebuild \
 
 1. Launch the app
 2. Enter your UniFi Controller details:
-   - **Host** — Controller URL (e.g., `https://192.168.1.1`)
-   - **Username** — Controller admin username
-   - **Password** — Controller admin password
-   - **Site ID** — UniFi site identifier (default: `default`)
+   - **Host URL** — Controller URL (e.g., `https://192.168.1.1`)
+   - **API Key** — UniFi API key (generate in UniFi Controller settings)
+   - **Site ID** — UniFi site identifier
 3. Click **Connect**
 
-Credentials are stored locally in macOS UserDefaults.
+The API key is stored securely in the macOS Keychain. Host and Site ID are stored in UserDefaults.
 
 ## Architecture
 

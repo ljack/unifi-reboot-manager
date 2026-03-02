@@ -2,6 +2,19 @@ import SwiftUI
 
 struct DetailPanelView: View {
     @Environment(DeviceManager.self) private var manager
+    @State private var showRebootConfirm = false
+
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fmt
+    }()
+
+    private static let isoFormatterNoFrac: ISO8601DateFormatter = {
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime]
+        return fmt
+    }()
 
     var body: some View {
         if let id = manager.selectedDeviceID, let entry = manager.devices[id] {
@@ -16,6 +29,14 @@ struct DetailPanelView: View {
                     statusHistory(entry)
                 }
                 .padding(20)
+                .alert("Confirm Reboot", isPresented: $showRebootConfirm) {
+                    Button("Cancel", role: .cancel) {}
+                    Button("Reboot", role: .destructive) {
+                        Task { await manager.rebootOne(id) }
+                    }
+                } message: {
+                    Text("This will restart \(entry.device.displayName). The device will be temporarily unavailable.")
+                }
             }
             .background(Theme.surface)
         } else {
@@ -167,7 +188,7 @@ struct DetailPanelView: View {
     @ViewBuilder
     private func rebootButton(_ entry: DeviceEntry) -> some View {
         Button {
-            Task { await manager.rebootOne(entry.id) }
+            showRebootConfirm = true
         } label: {
             Text("Reboot This Device")
                 .font(.system(size: 12, weight: .medium))
@@ -293,14 +314,11 @@ struct DetailPanelView: View {
     }
 
     private func formatHeartbeat(_ isoString: String) -> String {
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fmt.date(from: isoString) {
+        if let date = Self.isoFormatter.date(from: isoString) {
             return Fmt.time(date)
         }
         // Try without fractional seconds
-        fmt.formatOptions = [.withInternetDateTime]
-        if let date = fmt.date(from: isoString) {
+        if let date = Self.isoFormatterNoFrac.date(from: isoString) {
             return Fmt.time(date)
         }
         return isoString

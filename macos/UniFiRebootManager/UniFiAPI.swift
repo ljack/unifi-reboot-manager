@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 actor UniFiAPI {
     private var baseURL: String = ""
@@ -24,7 +25,7 @@ actor UniFiAPI {
 
         // Scope TLS bypass to only the configured controller host
         if let url = URL(string: host) {
-            certDelegate.allowedHost = url.host
+            certDelegate.setAllowedHost(url.host)
         }
     }
 
@@ -84,17 +85,20 @@ actor UniFiAPI {
 
 // Accept self-signed certificates only for the configured UniFi controller host
 final class SelfSignedCertDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
-    // Written once from actor-isolated configure(), read from URLSession delegate queue.
-    // This is safe because configure() is called before any requests are made.
-    var allowedHost: String?
+    private let allowedHost = OSAllocatedUnfairLock<String?>(initialState: nil)
+
+    func setAllowedHost(_ host: String?) {
+        allowedHost.withLock { $0 = host }
+    }
 
     func urlSession(
         _: URLSession,
         didReceive challenge: URLAuthenticationChallenge
     ) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        let allowed = allowedHost.withLock { $0 }
         if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
            let trust = challenge.protectionSpace.serverTrust,
-           let allowed = allowedHost,
+           let allowed,
            challenge.protectionSpace.host == allowed
         {
             return (.useCredential, URLCredential(trust: trust))

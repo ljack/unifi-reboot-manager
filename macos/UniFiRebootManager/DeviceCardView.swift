@@ -77,7 +77,7 @@ struct DeviceCardView: View {
     private var stateBadge: some View {
         HStack(spacing: 5) {
             if entry.state.isTransitioning {
-                TimelineView(.periodic(from: .now, by: 0.05)) { timeline in
+                TimelineView(.periodic(from: .now, by: 0.1)) { timeline in
                     let seconds = timeline.date.timeIntervalSinceReferenceDate
                     let opacity = 0.35 + 0.65 * (0.5 + 0.5 * cos(seconds * 2 * .pi / 1.2))
                     Circle()

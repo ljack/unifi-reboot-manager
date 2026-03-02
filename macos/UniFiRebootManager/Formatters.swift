@@ -28,9 +28,13 @@ enum Fmt {
         return String(format: "%.2f", v)
     }
 
-    static func time(_ date: Date) -> String {
+    private static let timeFormatter: DateFormatter = {
         let fmt = DateFormatter()
         fmt.dateFormat = "HH:mm:ss"
-        return fmt.string(from: date)
+        return fmt
+    }()
+
+    static func time(_ date: Date) -> String {
+        timeFormatter.string(from: date)
     }
 }
