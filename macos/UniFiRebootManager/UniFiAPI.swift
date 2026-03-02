@@ -4,14 +4,15 @@ actor UniFiAPI {
     private var baseURL: String = ""
     private var apiKey: String = ""
     private var siteID: String = ""
-    private let session: URLSession
+    private var session: URLSession
+    private let certDelegate = SelfSignedCertDelegate()
 
     init() {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 10
         self.session = URLSession(
             configuration: config,
-            delegate: SelfSignedCertDelegate.shared,
+            delegate: certDelegate,
             delegateQueue: nil
         )
     }
@@ -20,6 +21,11 @@ actor UniFiAPI {
         self.baseURL = host
         self.apiKey = apiKey
         self.siteID = siteID
+
+        // Scope TLS bypass to only the configured controller host
+        if let url = URL(string: host) {
+            certDelegate.allowedHost = url.host
+        }
     }
 
     private func apiURL(_ path: String) -> URL? {
@@ -76,16 +82,20 @@ actor UniFiAPI {
     }
 }
 
-// Accept self-signed certificates (UniFi controllers use self-signed TLS)
+// Accept self-signed certificates only for the configured UniFi controller host
 final class SelfSignedCertDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
-    static let shared = SelfSignedCertDelegate()
+    // Written once from actor-isolated configure(), read from URLSession delegate queue.
+    // This is safe because configure() is called before any requests are made.
+    var allowedHost: String?
 
     func urlSession(
         _: URLSession,
         didReceive challenge: URLAuthenticationChallenge
     ) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
         if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-           let trust = challenge.protectionSpace.serverTrust
+           let trust = challenge.protectionSpace.serverTrust,
+           let allowed = allowedHost,
+           challenge.protectionSpace.host == allowed
         {
             return (.useCredential, URLCredential(trust: trust))
         }

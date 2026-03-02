@@ -76,16 +76,20 @@ struct DeviceCardView: View {
 
     private var stateBadge: some View {
         HStack(spacing: 5) {
-            Circle()
-                .fill(Theme.stateColor(entry.state))
-                .frame(width: 7, height: 7)
-                .opacity(entry.state.isTransitioning ? pulseOpacity : 1)
-                .animation(
-                    entry.state.isTransitioning
-                        ? .easeInOut(duration: 1).repeatForever(autoreverses: true)
-                        : .default,
-                    value: entry.state
-                )
+            if entry.state.isTransitioning {
+                TimelineView(.periodic(from: .now, by: 0.05)) { timeline in
+                    let seconds = timeline.date.timeIntervalSinceReferenceDate
+                    let opacity = 0.35 + 0.65 * (0.5 + 0.5 * cos(seconds * 2 * .pi / 1.2))
+                    Circle()
+                        .fill(Theme.stateColor(entry.state))
+                        .frame(width: 7, height: 7)
+                        .opacity(opacity)
+                }
+            } else {
+                Circle()
+                    .fill(Theme.stateColor(entry.state))
+                    .frame(width: 7, height: 7)
+            }
 
             Text(entry.state.displayName)
                 .font(.system(size: 9, weight: .bold))
@@ -106,5 +110,4 @@ struct DeviceCardView: View {
         return parts.joined(separator: " · ")
     }
 
-    @State private var pulseOpacity: Double = 0.35
 }

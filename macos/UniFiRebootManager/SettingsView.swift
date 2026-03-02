@@ -11,7 +11,7 @@ struct SettingsView: View {
                 TextField("Host URL", text: $mgr.host, prompt: Text("https://192.168.1.1"))
                     .textFieldStyle(.roundedBorder)
 
-                TextField("API Key", text: $mgr.apiKey, prompt: Text("Your API key"))
+                SecureField("API Key", text: $mgr.apiKey, prompt: Text("Your API key"))
                     .textFieldStyle(.roundedBorder)
 
                 TextField("Site ID", text: $mgr.siteID, prompt: Text("Your site ID"))

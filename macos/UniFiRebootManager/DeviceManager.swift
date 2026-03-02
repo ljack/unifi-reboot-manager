@@ -20,8 +20,16 @@ final class DeviceManager {
     var host: String = UserDefaults.standard.string(forKey: "unifi_host") ?? "" {
         didSet { UserDefaults.standard.set(host, forKey: "unifi_host") }
     }
-    var apiKey: String = UserDefaults.standard.string(forKey: "unifi_api_key") ?? "" {
-        didSet { UserDefaults.standard.set(apiKey, forKey: "unifi_api_key") }
+    var apiKey: String = {
+        // Migrate from UserDefaults to Keychain on first launch
+        if let legacy = UserDefaults.standard.string(forKey: "unifi_api_key"), !legacy.isEmpty {
+            KeychainHelper.save(key: "unifi_api_key", value: legacy)
+            UserDefaults.standard.removeObject(forKey: "unifi_api_key")
+            return legacy
+        }
+        return KeychainHelper.load(key: "unifi_api_key") ?? ""
+    }() {
+        didSet { KeychainHelper.save(key: "unifi_api_key", value: apiKey) }
     }
     var siteID: String = UserDefaults.standard.string(forKey: "unifi_site_id") ?? "" {
         didSet { UserDefaults.standard.set(siteID, forKey: "unifi_site_id") }
@@ -79,6 +87,19 @@ final class DeviceManager {
     // MARK: - Initialization
 
     func loadDevices() async {
+        // Cancel any active monitoring/stats tasks before reloading
+        if monitoring {
+            monitoring = false
+            pingTask?.cancel()
+            pollTask?.cancel()
+            stuckTask?.cancel()
+            pingTask = nil
+            pollTask = nil
+            stuckTask = nil
+        }
+        idleStatsTask?.cancel()
+        idleStatsTask = nil
+
         isLoading = true
         error = nil
 
