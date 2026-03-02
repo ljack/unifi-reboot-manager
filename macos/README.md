@@ -1,5 +1,7 @@
 # UniFi Reboot Manager — macOS App
 
+<img src="UniFiRebootManager/Assets.xcassets/AppIcon.appiconset/icon_128.png" width="64" alt="App Icon">
+
 A native macOS application for managing and rebooting UniFi network devices. Built with SwiftUI, providing a fast, native experience with full feature parity to the web interface.
 
 ![UniFi Reboot Manager](screenshot.png)
