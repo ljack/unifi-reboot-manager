@@ -2,4 +2,5 @@
 .claude/
 .playwright-mcp/
 node_modules/
-*.png
+/*.png
+build/

@@ -1,0 +1,60 @@
+name: Build Main DMG
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-dmg:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          xcode_app="$(ls -1d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -n 1)"
+          if [[ -z "$xcode_app" ]]; then
+            echo "::error::No Xcode 16.x found on this runner."
+            ls -1 /Applications | grep '^Xcode' || true
+            exit 1
+          fi
+
+          sudo xcode-select -s "$xcode_app/Contents/Developer"
+          xcodebuild -version
+
+      - name: Make CI scripts executable
+        run: chmod +x scripts/ci/*.sh
+
+      - name: Build Release app
+        id: build
+        run: scripts/ci/build_release_app.sh
+
+      - name: Package DMG and checksum
+        id: package
+        run: |
+          mkdir -p build/artifacts
+          short_sha="${GITHUB_SHA::7}"
+          dmg_name="UniFiRebootManager-main-${short_sha}.dmg"
+          dmg_path="build/artifacts/${dmg_name}"
+
+          scripts/ci/package_dmg.sh "${{ steps.build.outputs.app_path }}" "$dmg_path" "UniFi Reboot Manager (main ${short_sha})"
+          shasum -a 256 "$dmg_path" > "${dmg_path}.sha256"
+
+          echo "dmg_path=$dmg_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UniFiRebootManager-main-${{ github.sha }}
+          path: |
+            ${{ steps.package.outputs.dmg_path }}
+            ${{ steps.package.outputs.dmg_path }}.sha256
+          if-no-files-found: error
+          retention-days: 30

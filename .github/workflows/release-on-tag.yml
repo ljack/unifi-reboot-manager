@@ -1,0 +1,95 @@
+name: Release DMG on Tag
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+
+    env:
+      SIGNING_ENABLED: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
+      NOTARIZATION_ENABLED: ${{ secrets.APPLE_ID != '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          xcode_app="$(ls -1d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -n 1)"
+          if [[ -z "$xcode_app" ]]; then
+            echo "::error::No Xcode 16.x found on this runner."
+            ls -1 /Applications | grep '^Xcode' || true
+            exit 1
+          fi
+
+          sudo xcode-select -s "$xcode_app/Contents/Developer"
+          xcodebuild -version
+
+      - name: Make CI scripts executable
+        run: chmod +x scripts/ci/*.sh
+
+      - name: Import signing certificate
+        if: env.SIGNING_ENABLED == 'true'
+        id: cert
+        run: scripts/ci/import_certificate.sh
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Build Release app
+        id: build
+        run: scripts/ci/build_release_app.sh
+        env:
+          DEVELOPMENT_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Package DMG and checksum
+        id: package
+        run: |
+          mkdir -p build/artifacts
+          tag="${GITHUB_REF_NAME}"
+          dmg_name="UniFiRebootManager-${tag}.dmg"
+          dmg_path="build/artifacts/${dmg_name}"
+
+          scripts/ci/package_dmg.sh "${{ steps.build.outputs.app_path }}" "$dmg_path" "UniFi Reboot Manager ${tag}"
+          shasum -a 256 "$dmg_path" > "${dmg_path}.sha256"
+
+          echo "dmg_path=$dmg_path" >> "$GITHUB_OUTPUT"
+        env:
+          CODE_SIGN_IDENTITY: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' && 'Developer ID Application' || '' }}
+
+      - name: Notarize DMG
+        if: env.NOTARIZATION_ENABLED == 'true'
+        run: scripts/ci/notarize.sh "${{ steps.package.outputs.dmg_path }}"
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+
+      - name: Regenerate checksum after notarization
+        if: env.NOTARIZATION_ENABLED == 'true'
+        run: shasum -a 256 "${{ steps.package.outputs.dmg_path }}" > "${{ steps.package.outputs.dmg_path }}.sha256"
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          if security list-keychains -d user | grep -q "build.keychain-db"; then
+            security delete-keychain build.keychain-db
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: UniFi Reboot Manager ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            ${{ steps.package.outputs.dmg_path }}
+            ${{ steps.package.outputs.dmg_path }}.sha256
