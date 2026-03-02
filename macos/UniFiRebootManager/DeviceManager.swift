@@ -17,17 +17,14 @@ final class DeviceManager {
 
     // MARK: - Configuration (persisted)
 
-    var host: String {
-        get { UserDefaults.standard.string(forKey: "unifi_host") ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: "unifi_host") }
+    var host: String = UserDefaults.standard.string(forKey: "unifi_host") ?? "" {
+        didSet { UserDefaults.standard.set(host, forKey: "unifi_host") }
     }
-    var apiKey: String {
-        get { UserDefaults.standard.string(forKey: "unifi_api_key") ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: "unifi_api_key") }
+    var apiKey: String = UserDefaults.standard.string(forKey: "unifi_api_key") ?? "" {
+        didSet { UserDefaults.standard.set(apiKey, forKey: "unifi_api_key") }
     }
-    var siteID: String {
-        get { UserDefaults.standard.string(forKey: "unifi_site_id") ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: "unifi_site_id") }
+    var siteID: String = UserDefaults.standard.string(forKey: "unifi_site_id") ?? "" {
+        didSet { UserDefaults.standard.set(siteID, forKey: "unifi_site_id") }
     }
 
     // MARK: - Timing Constants

@@ -82,7 +82,8 @@ struct DetailPanelView: View {
         .padding(.bottom, 20)
     }
 
-    private func infoRow(_ label: String, _ value: String) -> some GridRow {
+    @ViewBuilder
+    private func infoRow(_ label: String, _ value: String) -> some View {
         GridRow {
             Text(label)
                 .foregroundStyle(Theme.dim)
